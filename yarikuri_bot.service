@@ -1,0 +1,31 @@
+# /etc/systemd/system/yarikuri_bot.service
+[Unit]
+Description=Yarikuri Discord Bot
+After=network.target
+
+[Service]
+# あなたの既存の運用に合わせてUserをrootに設定
+User=root
+
+# Botのプロジェクトディレクトリを指定
+WorkingDirectory=/home/ubuntu/Bot/discord/yarikuri/bot
+
+# 実行するコマンド
+ExecStart=/home/ubuntu/Bot/discord/yarikuri/bot/yarikuri_bot
+
+# 常に再起動し、再起動前には10秒待機する
+Restart=always
+RestartSec=10
+
+# ログをjournaldに転送し、識別子を設定
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yarikuri_bot
+
+# セキュリティ設定を反映
+NoNewPrivileges=true
+# Botが必要とする可能性のあるパスへの書き込み権限を明示的に許可
+ReadWritePaths=/home/ubuntu/Bot/discord/yarikuri/
+
+[Install]
+WantedBy=multi-user.target
