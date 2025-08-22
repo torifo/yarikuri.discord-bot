@@ -6,6 +6,7 @@
 *.dylib
 bot/yarikuri_bot
 bot/yarikuri_bot_test
+yarikuri_bot.service
 
 # Test binary, built with `go test -c`
 *.test
