@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -226,25 +227,90 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	go processReceipt(s, m, msg)
 }
 
-// processReceipt は画像を処理してレシート解析を実行する
-func processReceipt(s *discordgo.Session, m *discordgo.MessageCreate, msg *discordgo.Message) {
-	attachment := m.Attachments[0]
-	
-	// 画像をダウンロード
-	imagePath, err := downloadImage(attachment.URL)
+// ★★★ 画像解析のメインロジックを実装 ★★★
+func processReceipt(s *discordgo.Session, m *discordgo.MessageCreate, initialMsg *discordgo.Message) {
+	// 1. 状態を初期化してグローバルマップに登録
+	state := &TransactionState{InitialMessageID: m.ID}
+	transactions[m.ID] = state
+	defer delete(transactions, m.ID) // 処理が終わったら必ずマップから削除
+
+	// 2. 画像をダウンロード
+	imgPath, err := downloadImage(m.Attachments[0].URL)
 	if err != nil {
-		log.Printf("画像ダウンロードエラー: %v", err)
-		s.ChannelMessageEdit(m.ChannelID, msg.ID, "画像のダウンロードに失敗しました。")
+		s.ChannelMessageEdit(m.ChannelID, initialMsg.ID, "画像のダウンロードに失敗しました。")
 		return
 	}
+	state.ImagePath = imgPath
+	defer os.Remove(imgPath) // この関数が終了する際に画像を削除
+
+	// 3. AIに画像解析を依頼
+	s.ChannelMessageEdit(m.ChannelID, initialMsg.ID, "AIによる画像解析を実行中です...")
 	
-	// ダウンロード完了をユーザーに通知
-	s.ChannelMessageEdit(m.ChannelID, msg.ID, "画像をダウンロードしました。現在解析中です...")
+	imgData, err := os.ReadFile(imgPath)
+	if err != nil {
+		s.ChannelMessageEdit(m.ChannelID, initialMsg.ID, "画像ファイルの読み込みに失敗しました。")
+		return
+	}
+
+	prompt := genai.Text(`
+		あなたは、画像の内容を解析し、構造化されたJSONデータを出力するエキスパートシステムです。
+		添付された画像から、以下のルールに従って情報を抽出し、指定されたJSONフォーマットで出力してください。
+		# ルール
+		- is_receipt: 画像がレシート（領収書、明細書）であるかをtrueかfalseで判断します。風景や人物の写真など、明らかにレシートでない場合はfalseとし、他の項目はすべてnullにしてください。
+		- store_name: 店の名前を抽出します。
+		- date: 日付をYYYY-MM-DD形式で抽出します。年が記載されていない場合は、現在の年から推測してください。
+		- total_amount: 支払った最終的な合計金額を数値のみで抽出します。
+		- payment_method: 支払手段（現金、クレジットカード、楽天ペイなど）を抽出します。
+		# JSON出力フォーマット
+		` + "```json\n{\n  \"is_receipt\": true,\n  \"store_name\": \"（ここに店舗名）\",\n  \"date\": \"（YYYY-MM-DD形式の日付）\",\n  \"total_amount\": （ここに合計金額の数値）,\n  \"payment_method\": \"（ここに支払方法）\"\n}\n```")
 	
-	// TODO: ここでGemini APIを使用してレシート解析を実行
-	// 現在は簡単な応答のみ
-	finalMessage := fmt.Sprintf("レシート画像を受信しました。\n画像パス: %s\n今後の実装で解析機能を追加予定です。", imagePath)
-	s.ChannelMessageEdit(m.ChannelID, msg.ID, finalMessage)
+	ctx := context.Background()
+	resp, err := geminiClient.GenerateContent(ctx, genai.ImageData("png", imgData), prompt)
+	if err != nil {
+		s.ChannelMessageEdit(m.ChannelID, initialMsg.ID, "AIによる解析中にエラーが発生しました。")
+		log.Printf("Gemini APIエラー: %v", err)
+		return
+	}
+
+	// 4. 解析結果をパース
+	var analysisResult ReceiptAnalysis
+	// AIの応答からJSON部分のみを慎重に抽出
+	jsonStr := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
+	if strings.Contains(jsonStr, "```json") {
+		jsonStr = strings.Split(jsonStr, "```json\n")[1]
+		jsonStr = strings.Split(jsonStr, "```")[0]
+	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &analysisResult); err != nil {
+		s.ChannelMessageEdit(m.ChannelID, initialMsg.ID, "AIの応答を解析できませんでした。")
+		log.Printf("JSONパースエラー: %v\nOriginal Text: %s", err, jsonStr)
+		return
+	}
+	state.AnalysisResult = analysisResult
+
+	// 5. レシートでない場合の処理
+	if !analysisResult.IsReceipt {
+		s.ChannelMessageEdit(m.ChannelID, initialMsg.ID, "この画像はレシートではないようです。")
+		return
+	}
+
+	// 6. 解析結果を元に最終確認 (現在はメッセージ表示のみ)
+	var storeName, date, amountStr, paymentMethod string
+	if analysisResult.StoreName != nil { storeName = *analysisResult.StoreName } else { storeName = "不明" }
+	if analysisResult.Date != nil { date = *analysisResult.Date } else { date = "不明" }
+	if analysisResult.TotalAmount != nil { amountStr = fmt.Sprintf("%d円", *analysisResult.TotalAmount) } else { amountStr = "不明" }
+	if analysisResult.PaymentMethod != nil { paymentMethod = *analysisResult.PaymentMethod } else { paymentMethod = "不明" }
+	
+	finalMsg := fmt.Sprintf(
+		"**AIによる解析結果**\n"+
+		"店名: %s\n"+
+		"日付: %s\n"+
+		"合計金額: %s\n"+
+		"支払方法: %s\n\n"+
+		"この内容で登録しますか？ (現在は確認機能は未実装です)",
+		storeName, date, amountStr, paymentMethod,
+	)
+	s.ChannelMessageEdit(m.ChannelID, initialMsg.ID, finalMsg)
 }
 
 // (handleCheckMaster, handleShowMaster は変更なし)
@@ -484,7 +550,9 @@ func main() {
 			if strings.HasPrefix(customID, "paginate:") {
 				handlePagination(s, i)
 			}
-		// (モーダル送信時の処理を追加)
+		case discordgo.InteractionModalSubmit:
+			// モーダル送信時の処理を追加
+			log.Printf("モーダル送信を受信しました: %s", i.ModalSubmitData().CustomID)
 		}
 	})
 
