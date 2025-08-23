@@ -28,10 +28,11 @@ import (
 // =================================================================================
 var (
 	targetChannelID string
-	geminiClient    *genai.GenerativeModel // Gemini APIクライアント
+	geminiClient    *genai.GenerativeModel
 	typeListMap     map[string]string
 	typeKindMap     map[int]string
-	
+	transactions    map[string]*TransactionState // 進行中のトランザクションを管理
+
 	masterCategories   []Category
 	masterGroups       []Group
 	masterPaymentTypes []PaymentType
@@ -42,7 +43,8 @@ var (
 )
 
 const itemsPerPage = 15
-const queueFilePath = "queue.json" // 同期用キューのファイルパス
+const queueFilePath = "queue.json"
+const tempImageDir = "img" // 一時画像保存用ディレクトリ
 
 // =================================================================================
 // 構造体定義
@@ -54,7 +56,8 @@ type User struct { ID int; Name string }
 type SourceList struct { ID int; SourceName string; TypeID int }
 type TypeKind struct { ID int; TypeName string }
 type TypeList struct { ID string; TypeName string }
-// この構造体は `types.go` に分離し、ローカルAPIと共有する
+
+// ローカルAPIと共有するデータ構造
 type Expense struct {
 	Date       string `json:"date"`
 	Price      int    `json:"price"`
@@ -64,6 +67,24 @@ type Expense struct {
 	GroupID    *int   `json:"group_id,omitempty"`
 	PaymentID  *int   `json:"payment_id,omitempty"`
 }
+
+// レシート解析のJSON出力に対応する構造体
+type ReceiptAnalysis struct {
+	IsReceipt     bool    `json:"is_receipt"`
+	StoreName     *string `json:"store_name"`
+	Date          *string `json:"date"`
+	TotalAmount   *int    `json:"total_amount"`
+	PaymentMethod *string `json:"payment_method"`
+}
+
+// 各トランザクションの状態を管理する構造体
+type TransactionState struct {
+	InitialMessageID string
+	ImagePath        string
+	AnalysisResult   ReceiptAnalysis
+	// ... 今後ユーザーからの入力データを追加 ...
+}
+
 
 // =================================================================================
 // データ読み込み・解析関連
@@ -201,28 +222,35 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	
 	msg, _ := s.ChannelMessageSend(m.ChannelID, "画像を受け付けました。ダウンロードと解析を開始します...")
 
-	go func() {
-		imgPath, err := downloadImage(attachment.URL)
-		if err != nil {
-			s.ChannelMessageEdit(m.ChannelID, msg.ID, "画像のダウンロードに失敗しました。")
-			return
-		}
-		defer os.Remove(imgPath)
+	// --- 並行処理を開始 ---
+	go processReceipt(s, m, msg)
+}
 
-		s.ChannelMessageEdit(m.ChannelID, msg.ID, "AIによる画像解析を実行中です...")
-		
-		// (Gemini API呼び出しロジック)
-		
-		time.Sleep(2 * time.Second) // AI処理をシミュレート
-		s.ChannelMessageEdit(m.ChannelID, msg.ID, "解析が完了しました！(現在はダミーデータです)")
-	}()
+// processReceipt は画像を処理してレシート解析を実行する
+func processReceipt(s *discordgo.Session, m *discordgo.MessageCreate, msg *discordgo.Message) {
+	attachment := m.Attachments[0]
+	
+	// 画像をダウンロード
+	imagePath, err := downloadImage(attachment.URL)
+	if err != nil {
+		log.Printf("画像ダウンロードエラー: %v", err)
+		s.ChannelMessageEdit(m.ChannelID, msg.ID, "画像のダウンロードに失敗しました。")
+		return
+	}
+	
+	// ダウンロード完了をユーザーに通知
+	s.ChannelMessageEdit(m.ChannelID, msg.ID, "画像をダウンロードしました。現在解析中です...")
+	
+	// TODO: ここでGemini APIを使用してレシート解析を実行
+	// 現在は簡単な応答のみ
+	finalMessage := fmt.Sprintf("レシート画像を受信しました。\n画像パス: %s\n今後の実装で解析機能を追加予定です。", imagePath)
+	s.ChannelMessageEdit(m.ChannelID, msg.ID, finalMessage)
 }
 
 // (handleCheckMaster, handleShowMaster は変更なし)
 func handleCheckMaster(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	embed := &discordgo.MessageEmbed{
-		Title: "マスターデータ読み込み状況",
-		Color: 0x00ff00, 
+		Title: "マスターデータ読み込み状況", Color: 0x00ff00, 
 		Fields: []*discordgo.MessageEmbedField{
 			{Name: "カテゴリ", Value: fmt.Sprintf("%d 件", len(masterCategories)), Inline: true},
 			{Name: "グループ", Value: fmt.Sprintf("%d 件", len(masterGroups)), Inline: true},
@@ -241,16 +269,10 @@ func handleCheckMaster(s *discordgo.Session, i *discordgo.InteractionCreate) {
 func handleShowMaster(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	dataType := i.ApplicationCommandData().Options[0].StringValue()
 	embed, components, err := generatePaginatedData(dataType, 0)
-	if err != nil {
-		log.Printf("ページデータ生成エラー: %v", err)
-		return
-	}
+	if err != nil { log.Printf("ページデータ生成エラー: %v", err); return }
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Embeds:     []*discordgo.MessageEmbed{embed},
-			Components: components,
-		},
+		Data: &discordgo.InteractionResponseData{ Embeds: []*discordgo.MessageEmbed{embed}, Components: components, },
 	})
 }
 
@@ -258,17 +280,13 @@ func handleShowMaster(s *discordgo.Session, i *discordgo.InteractionCreate) {
 func handleAdd(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	var typeOptions []discordgo.SelectMenuOption
 	for _, typeItem := range masterTypeList {
-		typeOptions = append(typeOptions, discordgo.SelectMenuOption{
-			Label: typeItem.TypeName,
-			Value: typeItem.ID,
-		})
+		typeOptions = append(typeOptions, discordgo.SelectMenuOption{ Label: typeItem.TypeName, Value: typeItem.ID, })
 	}
 
 	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseModal,
 		Data: &discordgo.InteractionResponseData{
-			CustomID: "add_modal_step1",
-			Title:    "手動データ追加 (ステップ1/2)",
+			CustomID: "add_modal_step1", Title: "手動データ追加 (ステップ1/2)",
 			Components: []discordgo.MessageComponent{
 				discordgo.ActionsRow{ Components: []discordgo.MessageComponent{
 					discordgo.TextInput{
@@ -277,10 +295,7 @@ func handleAdd(s *discordgo.Session, i *discordgo.InteractionCreate) {
 					},
 				}},
 				discordgo.ActionsRow{ Components: []discordgo.MessageComponent{
-					discordgo.TextInput{
-						CustomID: "price", Label: "金額", Style: discordgo.TextInputShort,
-						Placeholder: "例: 1280", Required: true,
-					},
+					discordgo.TextInput{ CustomID: "price", Label: "金額", Style: discordgo.TextInputShort, Placeholder: "例: 1280", Required: true, },
 				}},
 				discordgo.ActionsRow{ Components: []discordgo.MessageComponent{
 					discordgo.TextInput{
@@ -295,9 +310,7 @@ func handleAdd(s *discordgo.Session, i *discordgo.InteractionCreate) {
 					},
 				}},
 				discordgo.ActionsRow{ Components: []discordgo.MessageComponent{
-					discordgo.SelectMenu{
-						CustomID: "payment_type_select", Placeholder: "支払い種別を選択", Options: typeOptions,
-					},
+					discordgo.SelectMenu{ CustomID: "payment_type_select", Placeholder: "支払い種別を選択", Options: typeOptions, },
 				}},
 			},
 		},
@@ -308,9 +321,6 @@ func handleAdd(s *discordgo.Session, i *discordgo.InteractionCreate) {
 // handleFix は /fix コマンドの処理
 func handleFix(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	keyword := i.ApplicationCommandData().Options[0].StringValue()
-	
-	// (queue.jsonを読み込んで検索するロジック)
-	
 	responseText := fmt.Sprintf("「%s」でキュー内のデータを検索します... (現在は検索機能は未実装です)", keyword)
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -322,56 +332,18 @@ func handleFix(s *discordgo.Session, i *discordgo.InteractionCreate) {
 
 // handlePagination は、ページネーションボタンが押された時の処理
 func handlePagination(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	log.Printf("handlePagination function called")
-	
-	// まず遅延応答でタイムアウトを回避
-	log.Printf("Sending deferred message update...")
-	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredMessageUpdate,
-	})
-	if err != nil {
-		log.Printf("遅延応答エラー: %v", err)
-		return
-	}
-	log.Printf("Deferred response sent successfully")
-
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{ Type: discordgo.InteractionResponseDeferredMessageUpdate, })
+	if err != nil { log.Printf("遅延応答エラー: %v", err); return }
 	customID := i.MessageComponentData().CustomID
-	log.Printf("Parsing CustomID: %s", customID)
 	parts := strings.Split(customID, ":")
-	if len(parts) != 3 {
-		log.Printf("CustomID形式エラー: %s", customID)
-		return
-	}
-	log.Printf("CustomID parts: %v", parts)
-
+	if len(parts) != 3 { log.Printf("CustomID形式エラー: %s", customID); return }
 	dataType := parts[1]
 	page, err := strconv.Atoi(parts[2])
-	if err != nil {
-		log.Printf("ページ番号解析エラー: %v", err)
-		return
-	}
-	log.Printf("DataType: %s, Page: %d", dataType, page)
-
-	// 新しいページのデータを生成
-	log.Printf("Generating paginated data...")
+	if err != nil { log.Printf("ページ番号解析エラー: %v", err); return }
 	embed, components, err := generatePaginatedData(dataType, page)
-	if err != nil {
-		log.Printf("ページデータ生成エラー: %v", err)
-		return
-	}
-	log.Printf("Paginated data generated successfully")
-
-	// メッセージを更新
-	log.Printf("Updating message...")
-	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Embeds:     &[]*discordgo.MessageEmbed{embed},
-		Components: &components,
-	})
-	if err != nil {
-		log.Printf("メッセージ更新エラー: %v", err)
-	} else {
-		log.Printf("Message updated successfully")
-	}
+	if err != nil { log.Printf("ページデータ生成エラー: %v", err); return }
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{ Embeds: &[]*discordgo.MessageEmbed{embed}, Components: &components, })
+	if err != nil { log.Printf("メッセージ更新エラー: %v", err) }
 }
 
 
@@ -451,10 +423,9 @@ func downloadImage(url string) (string, error) {
 	if err != nil { return "", err }
 	defer response.Body.Close()
 
-	imgDir := "img"
-	os.Mkdir(imgDir, 0755)
+	os.MkdirAll(tempImageDir, 0755)
 
-	filePath := filepath.Join(imgDir, filepath.Base(response.Request.URL.Path))
+	filePath := filepath.Join(tempImageDir, filepath.Base(response.Request.URL.Path))
 	file, err := os.Create(filePath)
 	if err != nil { return "", err }
 	defer file.Close()
@@ -490,6 +461,7 @@ func main() {
 	geminiClient = client.GenerativeModel("gemini-1.5-flash-latest")
 	log.Println("Gemini APIクライアントの初期化が完了しました。")
 
+	transactions = make(map[string]*TransactionState)
 
 	dg, err := discordgo.New("Bot " + botToken)
 	if err != nil { log.Fatalf("Error creating Discord session: %v", err) }
@@ -509,14 +481,10 @@ func main() {
 			}
 		case discordgo.InteractionMessageComponent:
 			customID := i.MessageComponentData().CustomID
-			log.Printf("MessageComponent received with CustomID: %s", customID)
 			if strings.HasPrefix(customID, "paginate:") {
-				log.Printf("Pagination button detected, calling handlePagination")
 				handlePagination(s, i)
-			} else {
-				log.Printf("Non-pagination component: %s", customID)
 			}
-		// (モーダル送信時の処理)
+		// (モーダル送信時の処理を追加)
 		}
 	})
 

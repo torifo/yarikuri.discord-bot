@@ -46,6 +46,7 @@ sudo cp yarikuri_bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable yarikuri_bot
 sudo systemctl start yarikuri_bot
+sudo systemctl restart yarikuri_bot
 
 # 状態確認
 sudo systemctl status yarikuri_bot
