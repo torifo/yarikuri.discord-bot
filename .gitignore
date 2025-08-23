@@ -1,4 +1,8 @@
-# Binaries for programs and plugins
+# ===========================================
+# Go 関連ファイル
+# ===========================================
+
+# Go実行可能ファイル
 *.exe
 *.exe~
 *.dll
@@ -6,67 +10,104 @@
 *.dylib
 bot/yarikuri_bot
 bot/yarikuri_bot_test
-yarikuri_bot.service
 
-# Test binary, built with `go test -c`
+# Goテスト関連
 *.test
-
-# Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-# Dependency directories (remove the comment below to include it)
+# Go依存関係
 # vendor/
 
-# Go workspace file
+# Goワークスペースファイル
 go.work
 
-# Environment files
+# ===========================================
+# 設定ファイル・機密情報
+# ===========================================
+
+# 環境変数ファイル
 .env
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
 
-# IDE files
+# systemdサービスファイル
+yarikuri_bot.service
+
+# ===========================================
+# データベース・データファイル
+# ===========================================
+
+# データベースファイル
+*.db
+*.sqlite
+*.sqlite3
+
+# データベースダンプ
+dump_local_db/
+
+# サンプルデータ
+detail_samples
+
+# ===========================================
+# IDE・エディタ関連
+# ===========================================
+
+# Visual Studio Code
 .vscode/
+
+# IntelliJ IDEA
 .idea/
+
+# Vim
 *.swp
 *.swo
 *~
 
-# OS generated files
+# ===========================================
+# OS生成ファイル
+# ===========================================
+
+# macOS
 .DS_Store
 .DS_Store?
 ._*
 .Spotlight-V100
 .Trashes
+
+# Windows
 ehthumbs.db
 Thumbs.db
 
-# Log files
+# ===========================================
+# ログファイル
+# ===========================================
+
+# ログファイル
 *.log
 logs/
 
-# Database files
-*.db
-*.sqlite
-*.sqlite3
+# ===========================================
+# 一時ファイル・キャッシュ
+# ===========================================
 
-# Database dumps
-dump_local_db/
+# 一時ディレクトリ
+tmp/
+temp/
+*.tmp
 
-# Archives and compressed files
+# アーカイブファイル
 *.tar.gz
 *.zip
 *.rar
 *.7z
 go*.linux-amd64.tar.gz
 
-# Temporary files
-tmp/
-temp/
-*.tmp
+# ===========================================
+# ビルド成果物
+# ===========================================
 
-# Build artifacts
+# ビルドディレクトリ
 dist/
 build/
