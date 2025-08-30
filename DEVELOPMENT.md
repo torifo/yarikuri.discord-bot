@@ -71,6 +71,9 @@ sudo systemctl stop yarikuri_bot
 # 再起動
 sudo systemctl restart yarikuri_bot
 
+# まとめて実行
+sudo systemctl daemon-reload && sudo systemctl restart yarikuri_bot && sudo systemctl status yarikuri_bot
+
 # ログ確認
 sudo journalctl -u yarikuri_bot -f
 ```
@@ -234,6 +237,74 @@ var (
 - ログ出力: journald 統合
 - 実行ユーザー: root
 - 作業ディレクトリ: `/home/ubuntu/Bot/discord/yarikuri/bot`
+
+## 最新実装済み機能（2025-08-24）
+
+### レシート解析システムの編集機能実装
+
+#### 概要
+レシート画像をAIで解析した後、キュー追加前にユーザーが各項目を編集できる確認画面を実装しました。
+
+#### 実装内容
+
+##### 1. 確認画面システム
+```go
+// 確認データ構造体
+type ConfirmationData struct {
+    MessageID     string
+    Date          string
+    Amount        int
+    CategoryID    int
+    GroupID       *int
+    UserID        int
+    Detail        string
+    PaymentMethod string
+    AIResult      ReceiptAnalysis
+}
+```
+
+##### 2. 編集機能一覧
+- **📅 日付編集**: モーダルによるYYYY-MM-DD形式での編集
+- **💵 金額編集**: 数値入力による金額変更
+- **💳 支払い方法編集**: テキスト入力による支払い方法変更
+- **🏷️ グループ編集**: セレクトメニューによるグループ選択（「なし」も選択可能）
+- **👤 支払者編集**: ユーザー一覧からのセレクト選択
+- **📝 詳細編集**: テキストエリアによる詳細情報編集
+
+##### 3. 主要関数
+- [`sendProcessingResult()`](bot/main.go:901-1033): 確認画面の初期表示
+- [`storeConfirmationData()`](bot/main.go:1036-1055): 確認データの一時保存
+- [`updateConfirmationData()`](bot/main.go:1070-1081): 確認データの更新
+- [`updateConfirmationDisplay()`](bot/main.go:8-107): 確認画面の更新表示
+- [`handleAddToQueue()`](bot/main.go:195-238): キューへの最終追加処理
+- [`handleCancelEntry()`](bot/main.go:240-261): エントリのキャンセル処理
+
+##### 4. 新しい処理フロー
+```
+1. 画像投稿 → AI解析開始
+2. カテゴリー選択画面
+3. ユーザー情報入力モーダル
+4. 🆕 確認画面表示（各項目編集可能）
+   ├── 日付編集ボタン
+   ├── 金額編集ボタン
+   ├── 支払い方法編集ボタン
+   ├── グループ編集ボタン
+   ├── 支払者編集ボタン
+   ├── 詳細編集ボタン
+   ├── ✅ キューに追加ボタン
+   └── ❌ キャンセルボタン
+5. データをキューに保存
+```
+
+##### 5. Discord Interaction活用
+- **モーダル**: 日付、金額、支払い方法、詳細の編集
+- **セレクトメニュー**: グループ、支払者の選択
+- **ボタン**: 各編集機能の起動とアクション実行
+
+##### 6. データ管理
+- `confirmationData map[string]*ConfirmationData`: メモリ上での一時データ管理
+- `sync.Mutex`: 並行アクセス制御
+- エフェメラルメッセージ: ユーザー個別の編集フィードバック
 
 ## 今後の実装予定機能
 
