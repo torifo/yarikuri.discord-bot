@@ -135,7 +135,7 @@ var (
 const itemsPerPage = 15
 const queueFilePath = "queue.json"
 const tempImageDir = "./img"
-const detailSamplesDir = "../detail_samples" // 詳細説明サンプルのディレクトリ
+const detailSamplesDir = "./detail_samples" // 詳細説明サンプルのディレクトリ
 
 // =================================================================================
 // 構造体定義
@@ -2310,11 +2310,26 @@ func handleAddToQueue(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		GroupID:    data.GroupID,
 	}
 	
-	// TODO: ここでキューファイルに保存する処理を実装
-	// 現在は仮の成功処理
+	// Expenseキューファイルに保存
+	err := saveExpenseToQueue(expense)
+	if err != nil {
+		botErr := NewBotError(ErrorTypeFileIO, "Expenseキューファイル保存エラー", err).
+			WithContext("expense", fmt.Sprintf("%+v", expense))
+		LogBotError(botErr)
+		
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "❌ エラー: キューへの保存に失敗しました。",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+	
 	log.Printf("キューに追加: %+v", expense)
 	
-	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: "✅ データをキューに追加しました。",
@@ -2322,7 +2337,9 @@ func handleAddToQueue(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		},
 	})
 	if err != nil {
-		log.Printf("キュー追加応答エラー: %v", err)
+		botErr := NewBotError(ErrorTypeDiscordAPI, "キュー追加応答エラー", err).
+			WithContext("message_id", messageID)
+		LogBotError(botErr)
 	}
 
 	// 確認データを削除
@@ -2331,6 +2348,48 @@ func handleAddToQueue(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	mu.Unlock()
 	
 	log.Printf("キュー追加完了: messageID=%s", messageID)
+}
+
+// saveExpenseToQueue はExpenseをキューファイルに保存する
+func saveExpenseToQueue(expense Expense) error {
+	const expenseQueueFile = "../queues/expense_queue.json"
+	
+	// 既存のExpenseキューを読み込み
+	var expenseQueue []Expense
+	data, err := os.ReadFile(expenseQueueFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return NewBotError(ErrorTypeFileIO, "Expenseキューファイル読み込みエラー", err).
+				WithContext("file_path", expenseQueueFile)
+		}
+		// ファイルが存在しない場合は空のキューで開始
+		expenseQueue = []Expense{}
+	} else {
+		// 既存データをパース
+		if err := json.Unmarshal(data, &expenseQueue); err != nil {
+			return NewBotError(ErrorTypeFileIO, "ExpenseキューJSONパースエラー", err).
+				WithContext("file_path", expenseQueueFile)
+		}
+	}
+	
+	// 新しいExpenseを追加
+	expenseQueue = append(expenseQueue, expense)
+	
+	// ファイルに保存
+	updatedData, err := json.MarshalIndent(expenseQueue, "", "  ")
+	if err != nil {
+		return NewBotError(ErrorTypeFileIO, "ExpenseキューJSON生成エラー", err).
+			WithContext("queue_length", len(expenseQueue))
+	}
+	
+	err = os.WriteFile(expenseQueueFile, updatedData, 0644)
+	if err != nil {
+		return NewBotError(ErrorTypeFileIO, "Expenseキューファイル書き込みエラー", err).
+			WithContext("file_path", expenseQueueFile)
+	}
+	
+	log.Printf("Expenseキューに追加完了: %s (total: %d件)", expenseQueueFile, len(expenseQueue))
+	return nil
 }
 
 // getMasterDataWithQueue は既存マスターデータ + キューを結合して返す
