@@ -134,7 +134,7 @@ var (
 
 const itemsPerPage = 15
 const queueFilePath = "queue.json"
-const tempImageDir = "./img"
+const tempImageDir = "./bot/img"
 const detailSamplesDir = "./detail_samples" // 詳細説明サンプルのディレクトリ
 
 // =================================================================================
@@ -176,15 +176,19 @@ type TransactionState struct {
 }
 
 type ConfirmationData struct {
-	MessageID     string
-	Date          string
-	Amount        int
-	CategoryID    int
-	GroupID       *int
-	UserID        int
-	Detail        string
-	PaymentMethod string
-	AIResult      ReceiptAnalysis
+	MessageID        string
+	Date             string
+	Amount           int
+	CategoryID       int
+	GroupID          *int
+	UserID           int
+	Detail           string
+	PaymentMethod    string
+	AIResult         ReceiptAnalysis
+	OriginalAmount   *int  // 元の総額（分割処理用）
+	RemainingAmount  *int  // 残り金額（分割処理用）
+	IsPartialEntry   bool  // 分割エントリかどうか
+	ParentMessageID  *string // 親のメッセージID（分割の場合）
 }
 
 // マスターデータキューアイテム
@@ -1516,7 +1520,7 @@ func handleEditAmount(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	}
 }
 
-// handleEditPayment は支払い方法編集モーダルを表示する
+// handleEditPayment は支払い方法編集用のセレクトメニューまたはモーダルを表示する
 func handleEditPayment(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	customID := i.MessageComponentData().CustomID
 	messageID := strings.TrimPrefix(customID, "edit_payment:")
@@ -1533,6 +1537,114 @@ func handleEditPayment(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 	
+	// 現在の支払い方法がcreditの場合、詳細選択を提供
+	if strings.ToLower(data.PaymentMethod) == "クレジット" || strings.ToLower(data.PaymentMethod) == "credit" {
+		// type_kindがcardの支払い方法を取得
+		cardPaymentOptions := getCardPaymentOptions()
+		
+		if len(cardPaymentOptions) > 0 {
+			err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "💳 クレジット系の詳細な支払い方法を選択してください:",
+					Flags:   discordgo.MessageFlagsEphemeral,
+					Components: []discordgo.MessageComponent{
+						discordgo.ActionsRow{
+							Components: []discordgo.MessageComponent{
+								discordgo.SelectMenu{
+									CustomID:    "credit_detail_select:" + messageID,
+									Placeholder: "詳細な支払い方法を選択...",
+									Options:     cardPaymentOptions,
+								},
+							},
+						},
+						discordgo.ActionsRow{
+							Components: []discordgo.MessageComponent{
+								discordgo.Button{
+									CustomID: "payment_manual_input:" + messageID,
+									Label:    "✏️ 手動入力",
+									Style:    discordgo.SecondaryButton,
+								},
+							},
+						},
+					},
+				},
+			})
+			if err != nil {
+				log.Printf("クレジット詳細選択メニュー表示エラー: %v", err)
+			}
+			return
+		}
+	}
+	
+	// 通常の支払い方法編集モーダルを表示
+	showPaymentEditModal(s, i, messageID, data.PaymentMethod)
+}
+
+// getCardPaymentOptions はtype_kindがcardの支払い方法オプションを取得する
+func getCardPaymentOptions() []discordgo.SelectMenuOption {
+	var options []discordgo.SelectMenuOption
+	
+	// type_kindからcardのIDを探す
+	var cardTypeID int
+	for _, typeKind := range masterTypeKind {
+		if strings.ToLower(typeKind.TypeName) == "card" || typeKind.TypeName == "カード" {
+			cardTypeID = typeKind.ID
+			break
+		}
+	}
+	
+	// cardTypeIDに対応するtype_listのIDを探す
+	var cardTypeListIDs []string
+	for _, typeList := range masterTypeList {
+		// type_listとtype_kindの関連を確認（IDが一致するかチェック）
+		if typeKindId, err := strconv.Atoi(typeList.ID); err == nil && typeKindId == cardTypeID {
+			cardTypeListIDs = append(cardTypeListIDs, typeList.ID)
+		}
+	}
+	
+	// card系のpayment_typeを取得
+	for _, payment := range masterPaymentTypes {
+		for _, cardTypeListID := range cardTypeListIDs {
+			if payment.TypeID == cardTypeListID {
+				if len(options) >= 25 { // Discord SelectMenuの制限
+					break
+				}
+				options = append(options, discordgo.SelectMenuOption{
+					Label: payment.PayKind,
+					Value: payment.PayKind,
+				})
+			}
+		}
+		// 直接的なカード系キーワードマッチも追加
+		paymentLower := strings.ToLower(payment.PayKind)
+		if (strings.Contains(paymentLower, "カード") || strings.Contains(paymentLower, "card") ||
+			strings.Contains(paymentLower, "クレジット") || strings.Contains(paymentLower, "credit") ||
+			strings.Contains(paymentLower, "デビット") || strings.Contains(paymentLower, "debit")) {
+			
+			// 重複チェック
+			duplicate := false
+			for _, existingOption := range options {
+				if existingOption.Value == payment.PayKind {
+					duplicate = true
+					break
+				}
+			}
+			
+			if !duplicate && len(options) < 25 {
+				options = append(options, discordgo.SelectMenuOption{
+					Label: payment.PayKind,
+					Value: payment.PayKind,
+				})
+			}
+		}
+	}
+	
+	return options
+}
+
+// showPaymentEditModal は支払い方法編集モーダルを表示する
+func showPaymentEditModal(s *discordgo.Session, i *discordgo.InteractionCreate, messageID, currentPaymentMethod string) {
 	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseModal,
 		Data: &discordgo.InteractionResponseData{
@@ -1545,7 +1657,7 @@ func handleEditPayment(s *discordgo.Session, i *discordgo.InteractionCreate) {
 						Label:       "支払い方法",
 						Style:       discordgo.TextInputShort,
 						Required:    true,
-						Value:       data.PaymentMethod,
+						Value:       currentPaymentMethod,
 						Placeholder: "例: クレジット, 現金, デビット",
 					},
 				}},
@@ -1834,7 +1946,7 @@ func analyzeReceiptInBackground(s *discordgo.Session, m *discordgo.MessageCreate
 
 日付: [yyyy/mm/dd形式または省略形式]
 金額: [金額（整数または小数）]
-支払い方法: [クレジット/現金/その他の支払い方法]
+支払い方法: [レシートに記載されている実際の支払い方法]
 カテゴリー: [御飯代/交通費/その他のカテゴリー]
 グループ: [グループ名またはnull]
 ユーザー: [ユーザー名]
@@ -1843,7 +1955,11 @@ func analyzeReceiptInBackground(s *discordgo.Session, m *discordgo.MessageCreate
 **重要ルール：**
 1. 日付はyyyy/mm/dd形式で記載してください。ただし、月や日が一桁の場合は0を省略してもよい（例: 2025/8/19 や 2025-8-19）
 2. 金額は整数または小数で記載してください（円マークは不要）
-3. 支払い方法でカードやクレジット系の場合は「クレジット」と記載してください
+3. 支払い方法は画像に表示されている実際の方法を正確に記載してください：
+	  - クレジットカードの場合：「クレジットカード」または具体的なカード名
+	  - 電子マネー/QR決済：「楽天ペイ」「PayPay」「QuicPay」「iD」「Suica」など実際の名称
+	  - 現金の場合：「現金」
+	  - その他：実際に表示されている支払い方法名
 4. グループに該当する情報がない場合は「null」と記載してください
 5. ユーザーは基本的に「自分」としてください
 6. 詳細には店舗名や購入した商品名を含めてください
@@ -1886,7 +2002,9 @@ func analyzeReceiptInBackground(s *discordgo.Session, m *discordgo.MessageCreate
 		if strings.Contains(line, "支払い方法:") {
 			paymentStr := strings.TrimSpace(strings.Split(line, ":")[1])
 			if paymentStr != "" && paymentStr != "不明" {
-				analysisResult.PaymentMethod = &paymentStr
+				// クレジット系の場合、より詳細な分類を試みる
+				enhancedPaymentMethod := enhancePaymentMethod(paymentStr)
+				analysisResult.PaymentMethod = &enhancedPaymentMethod
 			}
 		}
 		if strings.Contains(line, "詳細:") {
@@ -1904,6 +2022,42 @@ func analyzeReceiptInBackground(s *discordgo.Session, m *discordgo.MessageCreate
 		analysisResult.IsReceipt, analysisResult.Date, analysisResult.TotalAmount)
 	
 	state.AIResultChan <- analysisResult
+}
+
+// enhancePaymentMethod は支払い方法をより詳細に分類する
+func enhancePaymentMethod(originalPaymentMethod string) string {
+	paymentLower := strings.ToLower(originalPaymentMethod)
+	
+	// クレジット系の場合、マスターデータから最適なマッチを探す
+	if strings.Contains(paymentLower, "クレジット") || strings.Contains(paymentLower, "credit") ||
+		strings.Contains(paymentLower, "カード") || strings.Contains(paymentLower, "card") {
+		
+		// マスターデータから最適なカード系支払い方法を探す
+		cardPayments := getCardPaymentOptions()
+		
+		// 完全一致を優先
+		for _, option := range cardPayments {
+			optionLower := strings.ToLower(option.Label)
+			if optionLower == paymentLower {
+				log.Printf("支払い方法を詳細化: %s -> %s", originalPaymentMethod, option.Label)
+				return option.Label
+			}
+		}
+		
+		// 部分一致を試す
+		for _, option := range cardPayments {
+			optionLower := strings.ToLower(option.Label)
+			if strings.Contains(optionLower, paymentLower) || strings.Contains(paymentLower, optionLower) {
+				log.Printf("支払い方法を詳細化（部分一致）: %s -> %s", originalPaymentMethod, option.Label)
+				return option.Label
+			}
+		}
+		
+		// マッチしない場合は元の値を返す（後で手動選択可能）
+		return originalPaymentMethod
+	}
+	
+	return originalPaymentMethod
 }
 
 // =================================================================================
@@ -2029,6 +2183,18 @@ func main() {
 				handleGroupSelect(s, i)
 			} else if strings.HasPrefix(customID, "payer_select:") {
 				handlePayerSelect(s, i)
+			} else if strings.HasPrefix(customID, "credit_detail_select:") {
+				handleCreditDetailSelect(s, i)
+			} else if strings.HasPrefix(customID, "payment_manual_input:") {
+				handlePaymentManualInput(s, i)
+			} else if strings.HasPrefix(customID, "remaining_category_select:") {
+				handleRemainingCategorySelect(s, i)
+			} else if strings.HasPrefix(customID, "remaining_details:") {
+				handleRemainingDetails(s, i)
+			} else if strings.HasPrefix(customID, "skip_remaining:") {
+				handleSkipRemaining(s, i)
+			} else if strings.HasPrefix(customID, "add_remaining_to_queue:") {
+				handleAddRemainingToQueue(s, i)
 			}
 		case discordgo.InteractionModalSubmit:
 			customID := i.ModalSubmitData().CustomID
@@ -2279,6 +2445,53 @@ func handlePayerSelect(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	updateConfirmationDisplay(s, messageID)
 }
 
+// handleCreditDetailSelect はクレジット詳細選択を処理する
+func handleCreditDetailSelect(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	customID := i.MessageComponentData().CustomID
+	messageID := strings.TrimPrefix(customID, "credit_detail_select:")
+	
+	selectedPaymentMethod := i.MessageComponentData().Values[0]
+	
+	// データを更新
+	updateConfirmationData(messageID, func(data *ConfirmationData) {
+		data.PaymentMethod = selectedPaymentMethod
+	})
+	
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("✅ 支払い方法を「%s」に更新しました。", selectedPaymentMethod),
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
+	if err != nil {
+		log.Printf("クレジット詳細選択応答エラー: %v", err)
+	}
+	
+	// 確認画面を更新
+	updateConfirmationDisplay(s, messageID)
+}
+
+// handlePaymentManualInput は支払い方法の手動入力モーダルを表示する
+func handlePaymentManualInput(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	customID := i.MessageComponentData().CustomID
+	messageID := strings.TrimPrefix(customID, "payment_manual_input:")
+	
+	data := getConfirmationData(messageID)
+	if data == nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "エラー: データが見つかりません。",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+	
+	showPaymentEditModal(s, i, messageID, data.PaymentMethod)
+}
+
 // =================================================================================
 // キュー操作関数
 // =================================================================================
@@ -2298,6 +2511,12 @@ func handleAddToQueue(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			},
 		})
 		return
+	}
+	
+	// 総額チェック：入力金額が総額より少ない場合は分割処理
+	originalAmount := data.Amount
+	if data.AIResult.TotalAmount != nil && *data.AIResult.TotalAmount > 0 {
+		originalAmount = *data.AIResult.TotalAmount
 	}
 	
 	// Expenseデータを作成
@@ -2329,6 +2548,15 @@ func handleAddToQueue(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	
 	log.Printf("キューに追加: %+v", expense)
 	
+	// 分割処理チェック
+	remainingAmount := originalAmount - data.Amount
+	if remainingAmount > 0 {
+		// 残額がある場合、次のエントリ作成を促す
+		handlePartialAmountEntry(s, i, messageID, data, remainingAmount, originalAmount)
+		return
+	}
+	
+	// 通常の完了処理
 	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
@@ -2348,6 +2576,109 @@ func handleAddToQueue(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	mu.Unlock()
 	
 	log.Printf("キュー追加完了: messageID=%s", messageID)
+}
+
+// handlePartialAmountEntry は残額がある場合の次のエントリ作成を処理する
+func handlePartialAmountEntry(s *discordgo.Session, i *discordgo.InteractionCreate, messageID string, originalData *ConfirmationData, remainingAmount, totalAmount int) {
+	// 新しいメッセージIDを生成
+	newMessageID := generateUniqueID()
+	
+	// 残額用の新しい確認データを作成
+	newData := &ConfirmationData{
+		MessageID:       newMessageID,
+		Date:            originalData.Date,
+		Amount:          remainingAmount,
+		CategoryID:      1, // デフォルトカテゴリー
+		GroupID:         originalData.GroupID,
+		UserID:          originalData.UserID,
+		Detail:          "残額分",
+		PaymentMethod:   originalData.PaymentMethod,
+		AIResult:        originalData.AIResult,
+		OriginalAmount:  &totalAmount,
+		RemainingAmount: &remainingAmount,
+		IsPartialEntry:  true,
+		ParentMessageID: &messageID,
+	}
+	
+	// 新しい確認データを保存
+	storeConfirmationDataDirect(newMessageID, newData)
+	
+	// 分割処理の通知と新しい確認画面を表示
+	embed := &discordgo.MessageEmbed{
+		Title: "📊 金額分割処理",
+		Color: 0xff9900,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "✅ 保存完了", Value: fmt.Sprintf("¥%d", originalData.Amount), Inline: true},
+			{Name: "📋 総額", Value: fmt.Sprintf("¥%d", totalAmount), Inline: true},
+			{Name: "💰 残額", Value: fmt.Sprintf("¥%d", remainingAmount), Inline: true},
+		},
+		Description: "総額より少ない金額が入力されました。残りの金額分のエントリを作成してください。",
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "下記で残額分のカテゴリーや詳細を設定してください。",
+		},
+	}
+	
+	// カテゴリー選択用のSelectMenuオプションを準備（最初の25件）
+	var categoryOptions []discordgo.SelectMenuOption
+	for _, category := range masterCategories {
+		if len(categoryOptions) >= 25 {
+			break
+		}
+		categoryOptions = append(categoryOptions, discordgo.SelectMenuOption{
+			Label: category.Name,
+			Value: strconv.Itoa(category.ID),
+		})
+	}
+	
+	components := []discordgo.MessageComponent{
+		discordgo.ActionsRow{
+			Components: []discordgo.MessageComponent{
+				discordgo.SelectMenu{
+					CustomID:    "remaining_category_select:" + newMessageID,
+					Placeholder: "残額分のカテゴリーを選択...",
+					Options:     categoryOptions,
+				},
+			},
+		},
+		discordgo.ActionsRow{
+			Components: []discordgo.MessageComponent{
+				discordgo.Button{
+					CustomID: "remaining_details:" + newMessageID,
+					Label:    "📝 詳細を設定",
+					Style:    discordgo.SecondaryButton,
+				},
+				discordgo.Button{
+					CustomID: "skip_remaining:" + newMessageID,
+					Label:    "⏭️ 残額をスキップ",
+					Style:    discordgo.DangerButton,
+				},
+			},
+		},
+	}
+	
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds:     []*discordgo.MessageEmbed{embed},
+			Components: components,
+			Flags:      discordgo.MessageFlagsEphemeral,
+		},
+	})
+	if err != nil {
+		log.Printf("分割処理画面表示エラー: %v", err)
+	}
+}
+
+// storeConfirmationDataDirect は確認データを直接保存する
+func storeConfirmationDataDirect(messageID string, data *ConfirmationData) {
+	mu.Lock()
+	defer mu.Unlock()
+	
+	if confirmationData == nil {
+		confirmationData = make(map[string]*ConfirmationData)
+	}
+	
+	confirmationData[messageID] = data
 }
 
 // saveExpenseToQueue はExpenseをキューファイルに保存する
@@ -2817,4 +3148,197 @@ func handleCancelEntry(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	mu.Unlock()
 	
 	log.Printf("エントリキャンセル: messageID=%s", messageID)
+}
+
+// handleRemainingCategorySelect は残額分のカテゴリー選択を処理する
+func handleRemainingCategorySelect(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	customID := i.MessageComponentData().CustomID
+	messageID := strings.TrimPrefix(customID, "remaining_category_select:")
+	
+	selectedCategoryID := i.MessageComponentData().Values[0]
+	
+	// カテゴリーIDを数値に変換
+	categoryID, err := strconv.Atoi(selectedCategoryID)
+	if err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "❌ カテゴリー選択エラーが発生しました。",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+	
+	// データを更新
+	updateConfirmationData(messageID, func(data *ConfirmationData) {
+		data.CategoryID = categoryID
+	})
+	
+	// カテゴリー名を取得
+	var categoryName string = "不明"
+	for _, category := range masterCategories {
+		if category.ID == categoryID {
+			categoryName = category.Name
+			break
+		}
+	}
+	
+	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("✅ 残額分のカテゴリーを「%s」に設定しました。詳細を設定するか、このままキューに追加してください。", categoryName),
+			Flags:   discordgo.MessageFlagsEphemeral,
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.Button{
+							CustomID: "add_remaining_to_queue:" + messageID,
+							Label:    "✅ 残額分をキューに追加",
+							Style:    discordgo.SuccessButton,
+						},
+						discordgo.Button{
+							CustomID: "remaining_details:" + messageID,
+							Label:    "📝 詳細を設定",
+							Style:    discordgo.SecondaryButton,
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("残額カテゴリー選択応答エラー: %v", err)
+	}
+}
+
+// handleRemainingDetails は残額分の詳細設定モーダルを表示する
+func handleRemainingDetails(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	customID := i.MessageComponentData().CustomID
+	messageID := strings.TrimPrefix(customID, "remaining_details:")
+	
+	data := getConfirmationData(messageID)
+	if data == nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "エラー: データが見つかりません。",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+	
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseModal,
+		Data: &discordgo.InteractionResponseData{
+			CustomID: "remaining_detail_modal:" + messageID,
+			Title:    "残額分の詳細設定",
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+					discordgo.TextInput{
+						CustomID:    "detail",
+						Label:       "詳細説明",
+						Style:       discordgo.TextInputParagraph,
+						Required:    true,
+						Value:       data.Detail,
+						Placeholder: "残額分の用途や詳細を入力...",
+						MaxLength:   500,
+					},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("残額詳細モーダル表示エラー: %v", err)
+	}
+}
+
+// handleAddRemainingToQueue は残額分をキューに追加する処理
+func handleAddRemainingToQueue(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	customID := i.MessageComponentData().CustomID
+	messageID := strings.TrimPrefix(customID, "add_remaining_to_queue:")
+	
+	data := getConfirmationData(messageID)
+	if data == nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "❌ エラー: データが見つかりません。",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+	
+	// Expenseデータを作成
+	expense := Expense{
+		Date:       data.Date,
+		Price:      data.Amount,
+		CategoryID: data.CategoryID,
+		UserID:     data.UserID,
+		Detail:     data.Detail,
+		GroupID:    data.GroupID,
+	}
+	
+	// Expenseキューファイルに保存
+	err := saveExpenseToQueue(expense)
+	if err != nil {
+		botErr := NewBotError(ErrorTypeFileIO, "残額分Expenseキューファイル保存エラー", err).
+			WithContext("expense", fmt.Sprintf("%+v", expense))
+		LogBotError(botErr)
+		
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "❌ エラー: 残額分のキューへの保存に失敗しました。",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+	
+	log.Printf("残額分をキューに追加: %+v", expense)
+	
+	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: "✅ 残額分をキューに追加しました。処理を完了します。",
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
+	if err != nil {
+		log.Printf("残額分キュー追加応答エラー: %v", err)
+	}
+	
+	// 確認データを削除
+	mu.Lock()
+	delete(confirmationData, messageID)
+	mu.Unlock()
+	
+	log.Printf("残額分キュー追加完了: messageID=%s", messageID)
+}
+
+// handleSkipRemaining は残額分をスキップする処理
+func handleSkipRemaining(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	customID := i.MessageComponentData().CustomID
+	messageID := strings.TrimPrefix(customID, "skip_remaining:")
+	
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: "⏭️ 残額分をスキップしました。処理を完了します。",
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
+	if err != nil {
+		log.Printf("残額スキップ応答エラー: %v", err)
+	}
+	
+	// 残額データを削除
+	mu.Lock()
+	delete(confirmationData, messageID)
+	mu.Unlock()
+	
+	log.Printf("残額分をスキップ: messageID=%s", messageID)
 }
